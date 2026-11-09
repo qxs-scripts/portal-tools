@@ -1,0 +1,1951 @@
+-- This is an open-source, vibecoded project.
+
+--[[
+	PORTAL TOOLS  -  single LocalScript
+
+	SETUP: Insert a LocalScript into StarterGui and paste this in. Nothing else is needed.
+
+	Buttons (left side of the screen):
+		BLUE  (TP)   - instantly teleport to the nearest player (blue flash + wind)
+		GREEN (SAFE) - portal opens under you, you fall through, land 90 studs to your left
+		RED   (PORT) - opens a player list; click a player to shoot a portal 5 studs in front of you
+		               (or at the wall if one is in the way). Step through it and you come out
+		               20 studs behind that player.
+
+	LOOK: Rick-and-Morty style portals (swirling image layers, glowing rim, orbiting light
+	ribbons, white / light-green / dark-green particles) and cinematic teleports (light pillar,
+	rising rings, helix of light, shockwave, bloom + blur punch). Tweak sizes/speeds in CONFIG.
+
+	NOTE: Everything here is client-side, so the visual effects/sounds are only seen by YOU.
+	Other players just see your character move.
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+
+------------------------------------------------------------------------
+-- CONFIG
+------------------------------------------------------------------------
+local CONFIG = {
+	PORTAL_IMAGE = "rbxassetid://81558332228414",
+
+	SOUND_PORTAL = "rbxassetid://1013378689",        -- portal open / close
+	SOUND_TP     = "rbxassetid://124934430745275",   -- instant (blue) teleport
+	SOUND_ENTER  = "rbxassetid://84183563421633",    -- walked through a portal
+
+	PORTAL_SIZE     = 9.75,  -- studs (was 6.5, now 1.5x bigger)
+	SHOOT_DISTANCE  = 5,     -- studs in front of the player
+	BEHIND_DISTANCE = 20,    -- studs behind the target player
+	SAFE_TP_DISTANCE = 90,   -- studs to the left
+	CLOSE_DELAY     = 3,     -- seconds before a used portal closes
+	SPIN_SPEED      = 190,   -- degrees per second (was 110)
+
+	-- Screen-level polish (client only). Turn off if you ever want it calmer.
+	SCREEN_FX    = true,     -- bloom / blur / colour punch on teleports
+	CAMERA_SHAKE = true,     -- tiny camera kick on arrival
+
+	GREEN = Color3.fromRGB(60, 255, 110),
+	BLUE  = Color3.fromRGB(70, 170, 255),
+	RED   = Color3.fromRGB(255, 70, 70),
+
+	-- Portal palette: dark green + light green + glowing white
+	GREEN_DARK  = Color3.fromRGB(8, 110, 42),
+	GREEN_LIGHT = Color3.fromRGB(165, 255, 180),
+}
+
+local SMOKE_TEX = "rbxasset://textures/particles/smoke_main.dng"
+local SPARK_TEX = "rbxasset://textures/particles/sparkles_main.dng"
+-- Soft glowing blobs. Uses the smoke texture + full LightEmission so it reads as a glow.
+-- If you have a soft round-glow texture ID you like, drop it in here.
+local GLOW_TEX  = SMOKE_TEX
+
+
+------------------------------------------------------------------------
+-- CLEANUP FROM PREVIOUS RUNS (respawn safe)
+------------------------------------------------------------------------
+local oldGui = playerGui:FindFirstChild("PortalTools")
+if oldGui then oldGui:Destroy() end
+local oldFx = Workspace:FindFirstChild("ClientPortalFx")
+if oldFx then oldFx:Destroy() end
+
+local fx = Instance.new("Folder")
+fx.Name = "ClientPortalFx"
+fx.Parent = Workspace
+
+------------------------------------------------------------------------
+-- BASE GUI (flash overlay + toast are needed by the effects)
+------------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "PortalTools"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 50
+gui.Parent = playerGui
+
+local flash = Instance.new("Frame")
+flash.Name = "Flash"
+flash.Size = UDim2.fromScale(1, 1)
+flash.BackgroundTransparency = 1
+flash.BorderSizePixel = 0
+flash.Active = false
+flash.ZIndex = 100
+flash.Parent = gui
+
+local function screenFlash(color, startTransparency, duration)
+	flash.BackgroundColor3 = color
+	flash.BackgroundTransparency = startTransparency
+	TweenService:Create(flash, TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 1,
+	}):Play()
+end
+
+local toast = Instance.new("TextLabel")
+toast.Name = "Toast"
+toast.AnchorPoint = Vector2.new(0.5, 1)
+toast.Position = UDim2.new(0.5, 0, 1, -90)
+toast.AutomaticSize = Enum.AutomaticSize.X
+toast.Size = UDim2.fromOffset(0, 34)
+toast.BackgroundColor3 = Color3.fromRGB(14, 18, 16)
+toast.BackgroundTransparency = 1
+toast.TextTransparency = 1
+toast.TextColor3 = Color3.new(1, 1, 1)
+toast.Font = Enum.Font.GothamMedium
+toast.TextSize = 14
+toast.Text = ""
+toast.ZIndex = 90
+toast.Parent = gui
+do
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 14)
+	pad.PaddingRight = UDim.new(0, 14)
+	pad.Parent = toast
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = toast
+end
+
+local toastToken = 0
+local function notify(text)
+	toastToken += 1
+	local mine = toastToken
+	toast.Text = text
+	toast.BackgroundTransparency = 0.2
+	toast.TextTransparency = 0
+	task.delay(2, function()
+		if mine ~= toastToken then return end
+		TweenService:Create(toast, TweenInfo.new(0.3), {
+			BackgroundTransparency = 1,
+			TextTransparency = 1,
+		}):Play()
+	end)
+end
+
+------------------------------------------------------------------------
+-- HELPERS
+------------------------------------------------------------------------
+local function getRoot(plr)
+	local char = plr.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if root and hum and hum.Health > 0 then
+		return root, hum, char
+	end
+	return nil
+end
+
+local function makeRayParams()
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local list = { fx }
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr.Character then
+			table.insert(list, plr.Character)
+		end
+	end
+	params.FilterDescendantsInstances = list
+	params.IgnoreWater = true
+	params.RespectCanCollide = true
+	return params
+end
+
+local function newFxPart(size, cf)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Massless = true
+	p.Transparency = 1
+	p.Size = size
+	p.CFrame = cf
+	p.Parent = fx
+	return p
+end
+
+-- A CFrame lying flat, with its front face pointing up.
+local function flatCF(pos)
+	return CFrame.lookAt(pos, pos + Vector3.yAxis, Vector3.zAxis)
+end
+
+local function playSoundAt(id, position, volume, speed)
+	local holder = newFxPart(Vector3.new(0.2, 0.2, 0.2), CFrame.new(position))
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = volume or 1
+	s.PlaybackSpeed = speed or 1
+	s.RollOffMinDistance = 25
+	s.RollOffMaxDistance = 160
+	s.Parent = holder
+	s:Play()
+	Debris:AddItem(holder, 10)
+end
+
+------------------------------------------------------------------------
+-- EFFECT HELPERS
+------------------------------------------------------------------------
+local WHITE = Color3.new(1, 1, 1)
+local GREEN_DARK = CONFIG.GREEN_DARK
+local GREEN_LIGHT = CONFIG.GREEN_LIGHT
+
+-- A portal is 6.5 studs originally. Bigger portals are lifted so the bottom
+-- edge still touches the ground exactly where it used to.
+local PORTAL_LIFT = CONFIG.PORTAL_SIZE / 2 - 3.25
+
+local function rand(a, b)
+	return a + math.random() * (b - a)
+end
+
+local function tint(color, amount)
+	return color:Lerp(WHITE, amount)
+end
+
+local function shade(color, amount)
+	return color:Lerp(Color3.new(0, 0, 0), amount)
+end
+
+-- seq(t0, v0, t1, v1, ...) -> NumberSequence
+local function seq(...)
+	local args = { ... }
+	local points = {}
+	for i = 1, #args, 2 do
+		table.insert(points, NumberSequenceKeypoint.new(args[i], args[i + 1]))
+	end
+	return NumberSequence.new(points)
+end
+
+-- cseq(t0, c0, t1, c1, ...) -> ColorSequence
+local function cseq(...)
+	local args = { ... }
+	local points = {}
+	for i = 1, #args, 2 do
+		table.insert(points, ColorSequenceKeypoint.new(args[i], args[i + 1]))
+	end
+	return ColorSequence.new(points)
+end
+
+local function tween(inst, time, props, style, dir)
+	local tw = TweenService:Create(inst, TweenInfo.new(
+		time,
+		style or Enum.EasingStyle.Quad,
+		dir or Enum.EasingDirection.Out
+	), props)
+	tw:Play()
+	return tw
+end
+
+local function newEmitter(parent, props)
+	local e = Instance.new("ParticleEmitter")
+	e.Rate = 0
+	e.LightInfluence = 0
+	for k, v in pairs(props) do
+		e[k] = v
+	end
+	e.Parent = parent
+	return e
+end
+
+-- Glowing ribbon that follows a moving part (solid colour, tapers + fades).
+local function makeTrail(part, color, lifetime, width, glow)
+	local a0 = Instance.new("Attachment")
+	a0.Position = Vector3.new(0, width / 2, 0)
+	a0.Parent = part
+	local a1 = Instance.new("Attachment")
+	a1.Position = Vector3.new(0, -width / 2, 0)
+	a1.Parent = part
+
+	local tr = Instance.new("Trail")
+	tr.Attachment0 = a0
+	tr.Attachment1 = a1
+	tr.Lifetime = lifetime
+	tr.MinLength = 0.02
+	tr.FaceCamera = true
+	tr.LightEmission = glow
+	tr.LightInfluence = 0
+	tr.Color = cseq(0, tint(color, glow * 0.6), 0.35, color, 1, shade(color, 0.5))
+	tr.Transparency = seq(0, 0, 0.6, 0.4, 1, 1)
+	tr.WidthScale = seq(0, 1, 1, 0)
+	tr.Parent = part
+	return tr
+end
+
+------------------------------------------------------------------------
+-- SCREEN-LEVEL EFFECTS
+------------------------------------------------------------------------
+
+-- Quick bloom + blur + colour punch that eases out.
+local function screenFx(color, power)
+	if not CONFIG.SCREEN_FX then return end
+	power = power or 1
+
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.TintColor = tint(color, 0.45)
+	cc.Brightness = 0.1 * power
+	cc.Contrast = 0.2 * power
+	cc.Saturation = 0.35 * power
+	cc.Parent = Lighting
+
+	local bloom = Instance.new("BloomEffect")
+	bloom.Intensity = 1.5 * power
+	bloom.Size = 30
+	bloom.Threshold = 0.8
+	bloom.Parent = Lighting
+
+	local blur = Instance.new("BlurEffect")
+	blur.Size = 12 * power
+	blur.Parent = Lighting
+
+	local time = 0.75
+	tween(cc, time, { TintColor = WHITE, Brightness = 0, Contrast = 0, Saturation = 0 }, Enum.EasingStyle.Quint)
+	tween(bloom, time, { Intensity = 0 }, Enum.EasingStyle.Quint)
+	tween(blur, time * 0.8, { Size = 0 }, Enum.EasingStyle.Quint)
+	Debris:AddItem(cc, time + 0.1)
+	Debris:AddItem(bloom, time + 0.1)
+	Debris:AddItem(blur, time + 0.1)
+end
+
+local shaking = false
+local function cameraShake(intensity, duration)
+	local cam = Workspace.CurrentCamera
+	if not CONFIG.CAMERA_SHAKE or not cam or shaking then return end
+	shaking = true
+	local started = os.clock()
+	RunService:BindToRenderStep("PortalToolsShake", Enum.RenderPriority.Camera.Value + 1, function()
+		local a = (os.clock() - started) / duration
+		if a >= 1 then
+			RunService:UnbindFromRenderStep("PortalToolsShake")
+			shaking = false
+			return
+		end
+		local k = (1 - a) * (1 - a) * intensity
+		cam.CFrame = cam.CFrame * CFrame.Angles(
+			(math.random() - 0.5) * 0.02 * k,
+			(math.random() - 0.5) * 0.02 * k,
+			(math.random() - 0.5) * 0.01 * k
+		)
+	end)
+end
+
+local fovBusy = false
+local function fovPop(amount, inTime, outTime)
+	local cam = Workspace.CurrentCamera
+	if not cam or fovBusy then return end
+	fovBusy = true
+	task.spawn(function()
+		local base = cam.FieldOfView
+		tween(cam, inTime, { FieldOfView = base + amount }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out).Completed:Wait()
+		tween(cam, outTime, { FieldOfView = base }, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut).Completed:Wait()
+		fovBusy = false
+	end)
+end
+
+------------------------------------------------------------------------
+-- WORLD EFFECTS
+------------------------------------------------------------------------
+
+-- Two-layer ring (soft coloured glow + white-hot core) drawn on a thin part.
+-- Returns the list of { frame, stroke } layers so callers can animate them.
+local function buildRing(part, color, frac, thickness)
+	local layers = {}
+	local defs = {
+		{ c = color, mult = 2.4, tr = 0.6 },
+		{ c = tint(color, 0.8), mult = 1, tr = 0 },
+	}
+	for _, face in ipairs({ Enum.NormalId.Front, Enum.NormalId.Back }) do
+		local sg = Instance.new("SurfaceGui")
+		sg.Face = face
+		sg.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+		sg.CanvasSize = Vector2.new(512, 512)
+		sg.LightInfluence = 0
+		sg.Brightness = 3
+		sg.Adornee = part
+		sg.Parent = part
+
+		for _, def in ipairs(defs) do
+			local f = Instance.new("Frame")
+			f.AnchorPoint = Vector2.new(0.5, 0.5)
+			f.Position = UDim2.fromScale(0.5, 0.5)
+			f.Size = UDim2.fromScale(frac, frac)
+			f.BackgroundTransparency = 1
+			f.BorderSizePixel = 0
+			f.Parent = sg
+
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(0.5, 0)
+			corner.Parent = f
+
+			local stroke = Instance.new("UIStroke")
+			stroke.Color = def.c
+			stroke.Thickness = thickness * 2 * def.mult
+			stroke.Transparency = def.tr
+			stroke.Parent = f
+
+			table.insert(layers, { frame = f, stroke = stroke })
+		end
+	end
+	return layers
+end
+
+-- Expanding (or, with endFrac small + direction In, collapsing) shockwave ring.
+local function ringEffect(cf, diameter, color, duration, startFrac, thickness, endFrac, direction)
+	local part = newFxPart(Vector3.new(diameter, diameter, 0.05), cf)
+	local layers = buildRing(part, color, startFrac, thickness or 8)
+	local e = endFrac or 0.86
+	for _, l in ipairs(layers) do
+		tween(l.frame, duration, { Size = UDim2.fromScale(e, e) }, Enum.EasingStyle.Quint, direction or Enum.EasingDirection.Out)
+		tween(l.stroke, duration, { Transparency = 1 }, Enum.EasingStyle.Sine, Enum.EasingDirection.In)
+		tween(l.stroke, duration, { Thickness = 1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	end
+	Debris:AddItem(part, duration + 0.15)
+end
+
+-- A ring that floats upward (like a scanner sweeping over the character).
+local function risingRing(feet, color, diameter, delay, rise, duration)
+	task.delay(delay, function()
+		local part = newFxPart(Vector3.new(diameter, diameter, 0.05), flatCF(feet + Vector3.new(0, 0.15, 0)))
+		local layers = buildRing(part, color, 0.84, 7)
+		tween(part, duration, { CFrame = flatCF(feet + Vector3.new(0, rise, 0)) }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		for _, l in ipairs(layers) do
+			tween(l.stroke, duration, { Transparency = 1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		end
+		Debris:AddItem(part, duration + 0.15)
+	end)
+end
+
+-- Flat glowing disc that blooms outward (portal opening flash).
+local function discFlash(cf, diameter, color, duration, startTransparency)
+	local d = newFxPart(Vector3.new(0.05, 0.5, 0.5), cf * CFrame.Angles(0, math.rad(90), 0))
+	d.Shape = Enum.PartType.Cylinder
+	d.Material = Enum.Material.Neon
+	d.Color = color
+	d.Transparency = startTransparency or 0.2
+	tween(d, duration, {
+		Size = Vector3.new(0.05, diameter, diameter),
+		Transparency = 1,
+	}, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+	Debris:AddItem(d, duration + 0.1)
+end
+
+-- Beam of light shooting up from the ground and collapsing.
+local function lightPillar(feet, color, height, duration)
+	local function cylinder(diameter, c, startTransparency, life)
+		local part = newFxPart(
+			Vector3.new(height, diameter, diameter),
+			CFrame.new(feet + Vector3.new(0, height / 2, 0)) * CFrame.Angles(0, 0, math.rad(90))
+		)
+		part.Shape = Enum.PartType.Cylinder
+		part.Material = Enum.Material.Neon
+		part.Color = c
+		part.Transparency = startTransparency
+		tween(part, life, {
+			Size = Vector3.new(height, 0.05, 0.05),
+			Transparency = 1,
+		}, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		Debris:AddItem(part, life + 0.1)
+	end
+	cylinder(4.4, color, 0.5, duration)
+	cylinder(2.2, WHITE, 0.1, duration * 0.7)
+end
+
+-- Fast expanding energy spheres (white core + coloured shell).
+local function shockwave(position, color, maxDiameter, duration)
+	local function sphere(c, startTransparency, diameter, life)
+		local ball = newFxPart(Vector3.one, CFrame.new(position))
+		ball.Shape = Enum.PartType.Ball
+		ball.Material = Enum.Material.Neon
+		ball.Color = c
+		ball.Transparency = startTransparency
+		tween(ball, life, {
+			Size = Vector3.one * diameter,
+			Transparency = 1,
+		}, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		Debris:AddItem(ball, life + 0.1)
+	end
+	sphere(color, 0.45, maxDiameter, duration)
+	sphere(WHITE, 0.2, maxDiameter * 0.55, duration * 0.6)
+end
+
+-- Spiralling double-helix of glowing ribbons.
+local function windVortex(position, color, duration)
+	local count = 10
+	local runners = {}
+	for i = 1, count do
+		local dir = (i % 2 == 0) and 1 or -1
+		local angle = (i / count) * math.pi * 2 + rand(0, 0.5)
+		local height = rand(-3.2, -0.6)
+		local radius = (dir == 1) and rand(3.0, 4.0) or rand(1.8, 2.6)
+
+		local startPos = position + Vector3.new(math.cos(angle) * radius, height, math.sin(angle) * radius)
+		local part = newFxPart(Vector3.one * 0.2, CFrame.new(startPos))
+		local c = (i % 3 == 0) and WHITE or ((i % 3 == 1) and tint(color, 0.5) or color)
+		local trail = makeTrail(part, c, rand(0.3, 0.45), rand(0.2, 0.34), 1)
+
+		runners[i] = {
+			part = part,
+			trail = trail,
+			angle = angle,
+			height = height,
+			radius = radius,
+			speed = dir * rand(11, 17),
+			rise = rand(7, 13),
+		}
+	end
+
+	local t0 = os.clock()
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		local t = os.clock() - t0
+		local a = t / duration
+		if a >= 1 then
+			conn:Disconnect()
+			for _, d in ipairs(runners) do
+				d.trail.Enabled = false
+				Debris:AddItem(d.part, 0.7)
+			end
+			return
+		end
+		for _, d in ipairs(runners) do
+			local ang = d.angle + t * d.speed
+			local r = d.radius * (1 - 0.5 * a)
+			d.part.CFrame = CFrame.new(position + Vector3.new(math.cos(ang) * r, d.height + t * d.rise, math.sin(ang) * r))
+			if a > 0.75 then
+				d.trail.Enabled = false
+			end
+		end
+	end)
+end
+
+-- Layered burst: white-hot flash, arcing sparks, soft glow puffs, floating glints.
+local function particleBurst(position, color, count)
+	local p = newFxPart(Vector3.one * 0.5, CFrame.new(position))
+
+	local core = newEmitter(p, {
+		Texture = GLOW_TEX,
+		Color = ColorSequence.new(WHITE, tint(color, 0.5)),
+		LightEmission = 1,
+		Size = seq(0, 4, 1, 14),
+		Transparency = seq(0, 0.05, 0.4, 0.45, 1, 1),
+		Lifetime = NumberRange.new(0.25, 0.3),
+		Speed = NumberRange.new(0),
+	})
+
+	local sparks = newEmitter(p, {
+		Texture = SPARK_TEX,
+		Color = cseq(0, WHITE, 0.35, tint(color, 0.4), 1, color),
+		LightEmission = 1,
+		Size = seq(0, 1.0, 0.6, 0.55, 1, 0),
+		Transparency = seq(0, 0, 0.7, 0.15, 1, 1),
+		Lifetime = NumberRange.new(0.5, 1.1),
+		Speed = NumberRange.new(14, 34),
+		SpreadAngle = Vector2.new(180, 180),
+		Drag = 2.5,
+		Acceleration = Vector3.new(0, -14, 0),
+		Rotation = NumberRange.new(0, 360),
+	})
+
+	local puff = newEmitter(p, {
+		Texture = SMOKE_TEX,
+		Color = cseq(0, tint(color, 0.6), 0.5, color, 1, shade(color, 0.5)),
+		LightEmission = 0.9,
+		Size = seq(0, 2, 1, 9),
+		Transparency = seq(0, 0.25, 1, 1),
+		Lifetime = NumberRange.new(0.45, 0.9),
+		Speed = NumberRange.new(12, 26),
+		SpreadAngle = Vector2.new(180, 180),
+		Drag = 4,
+		Rotation = NumberRange.new(0, 360),
+		RotSpeed = NumberRange.new(-90, 90),
+	})
+
+	local glints = newEmitter(p, {
+		Texture = SPARK_TEX,
+		Color = ColorSequence.new(WHITE, tint(color, 0.5)),
+		LightEmission = 1,
+		Size = seq(0, 0.4, 0.5, 0.3, 1, 0),
+		Transparency = seq(0, 0, 0.6, 0.2, 1, 1),
+		Lifetime = NumberRange.new(0.9, 1.6),
+		Speed = NumberRange.new(2, 7),
+		SpreadAngle = Vector2.new(180, 180),
+		Drag = 1.5,
+		Acceleration = Vector3.new(0, 4, 0),
+		Rotation = NumberRange.new(0, 360),
+	})
+
+	local light = Instance.new("PointLight")
+	light.Color = color
+	light.Brightness = 10
+	light.Range = 34
+	light.Parent = p
+	tween(light, 0.55, { Brightness = 0 })
+
+	core:Emit(1)
+	sparks:Emit(count)
+	puff:Emit(math.floor(count * 0.35))
+	glints:Emit(math.floor(count * 0.5))
+	Debris:AddItem(p, 2.2)
+end
+
+-- Ring of sparks fired outward (or sucked inward) around a portal rim.
+-- Uses one little emitter per slot so every spark starts at a different spot.
+local function rimBurst(cf, radius, inward, count)
+	local slots = 18
+	for i = 1, slots do
+		local ang = (i / slots) * math.pi * 2
+		local c, s = math.cos(ang), math.sin(ang)
+		local out = cf.RightVector * c + cf.UpVector * s
+		local tangent = cf.RightVector * -s + cf.UpVector * c
+		local holder = newFxPart(Vector3.one * 0.2, CFrame.fromMatrix(cf.Position + out * radius, tangent, out))
+		local direction = inward and Enum.NormalId.Bottom or Enum.NormalId.Top
+
+		local sp = newEmitter(holder, {
+			Texture = SPARK_TEX,
+			Color = cseq(0, WHITE, 0.4, GREEN_LIGHT, 1, CONFIG.GREEN),
+			LightEmission = 1,
+			Size = seq(0, 0.8, 0.6, 0.45, 1, 0),
+			Transparency = seq(0, 0, 0.7, 0.2, 1, 1),
+			Lifetime = inward and NumberRange.new(0.35, 0.5) or NumberRange.new(0.45, 0.9),
+			Speed = inward and NumberRange.new(10, 15) or NumberRange.new(8, 22),
+			SpreadAngle = Vector2.new(22, 22),
+			Drag = inward and 0 or 2,
+			EmissionDirection = direction,
+			Rotation = NumberRange.new(0, 360),
+		})
+		local gl = newEmitter(holder, {
+			Texture = GLOW_TEX,
+			Color = cseq(0, WHITE, 0.4, GREEN_LIGHT, 1, GREEN_DARK),
+			LightEmission = 1,
+			Size = seq(0, 1, 1, 3.4),
+			Transparency = seq(0, 0.4, 1, 1),
+			Lifetime = NumberRange.new(0.4, 0.7),
+			Speed = NumberRange.new(2, 7),
+			SpreadAngle = Vector2.new(40, 40),
+			EmissionDirection = direction,
+			Rotation = NumberRange.new(0, 360),
+		})
+		sp:Emit(count)
+		gl:Emit(1)
+		Debris:AddItem(holder, 1.5)
+	end
+end
+
+-- Character glows white-hot, then settles into the effect colour as it fades.
+local function highlightChar(char, color, duration)
+	local h = Instance.new("Highlight")
+	h.FillColor = WHITE
+	h.OutlineColor = tint(color, 0.35)
+	h.FillTransparency = 0.05
+	h.OutlineTransparency = 0
+	h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	h.Parent = char
+	tween(h, duration, {
+		FillColor = color,
+		FillTransparency = 1,
+		OutlineTransparency = 1,
+	}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	Debris:AddItem(h, duration + 0.1)
+end
+
+-- A streak of light connecting two points (instant-teleport trail).
+local function warpBeam(from, to, color)
+	local a = newFxPart(Vector3.one * 0.2, CFrame.new(from))
+	local b = newFxPart(Vector3.one * 0.2, CFrame.new(to))
+	local a0 = Instance.new("Attachment")
+	a0.Parent = a
+	local a1 = Instance.new("Attachment")
+	a1.Parent = b
+
+	local beam = Instance.new("Beam")
+	beam.Attachment0 = a0
+	beam.Attachment1 = a1
+	beam.Color = ColorSequence.new(tint(color, 0.7), color)
+	beam.LightEmission = 1
+	beam.LightInfluence = 0
+	beam.FaceCamera = true
+	beam.Segments = 1
+	beam.Width0 = 2.2
+	beam.Width1 = 2.2
+	beam.Transparency = NumberSequence.new(0.1)
+	beam.Parent = a
+	tween(beam, 0.55, { Width0 = 0, Width1 = 0 }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+	Debris:AddItem(a, 0.7)
+	Debris:AddItem(b, 0.7)
+end
+
+-- You vanish: light pillar, collapsing rings, vortex, burst.
+local function departFx(position, color)
+	local feet = position - Vector3.new(0, 2.8, 0)
+	lightPillar(feet, color, 22, 0.5)
+	ringEffect(flatCF(feet + Vector3.new(0, 0.1, 0)), 24, color, 0.5, 0.1, 10)
+	risingRing(feet, color, 6, 0, 7, 0.4)
+	risingRing(feet, WHITE, 5, 0.06, 7.5, 0.4)
+	windVortex(position, color, 0.6)
+	particleBurst(position, color, 40)
+	shockwave(position, color, 16, 0.35)
+end
+
+-- You appear: bigger version of the above + screen punch.
+local function teleportFx(position, color, char)
+	local feet = position - Vector3.new(0, 2.8, 0)
+	local ground = feet + Vector3.new(0, 0.1, 0)
+	lightPillar(feet, color, 26, 0.65)
+	ringEffect(flatCF(ground), 30, color, 0.6, 0.1, 10)
+	ringEffect(flatCF(ground + Vector3.new(0, 0.05, 0)), 20, WHITE, 0.45, 0.1, 8)
+	risingRing(feet, color, 7, 0, 8, 0.55)
+	risingRing(feet, color, 6, 0.08, 8.5, 0.55)
+	risingRing(feet, WHITE, 5, 0.16, 9, 0.5)
+	windVortex(position, color, 0.8)
+	particleBurst(position, color, 55)
+	shockwave(position, color, 22, 0.45)
+	if char then
+		highlightChar(char, color, 0.8)
+	end
+	screenFx(color, 1)
+	cameraShake(1.2, 0.35)
+end
+
+------------------------------------------------------------------------
+-- PORTAL OBJECT
+------------------------------------------------------------------------
+local activePortals = {}
+
+local function closeAllPortals()
+	for portal in pairs(activePortals) do
+		portal.close(0)
+	end
+end
+
+-- Layers of the swirling portal image (spin multiplier, size, opacity).
+local LAYER_DEFS = {
+	{ scale = 1.00, spin = 1.00,  transparency = 0 },
+	{ scale = 0.80, spin = -1.45, transparency = 0.45 },
+	{ scale = 0.58, spin = 2.10,  transparency = 0.6 },
+}
+
+-- Glowing ribbons that orbit inside the portal (r = fraction of the radius).
+local ORBITS = {
+	{ r = 0.97, speed = 3.4,  color = WHITE,        life = 0.5,  width = 0.36, glow = 1,    phase = 0 },
+	{ r = 0.97, speed = 3.4,  color = WHITE,        life = 0.5,  width = 0.36, glow = 1,    phase = math.pi },
+	{ r = 0.88, speed = -4.6, color = GREEN_LIGHT,  life = 0.45, width = 0.30, glow = 1,    phase = 1.3 },
+	{ r = 0.88, speed = -4.6, color = GREEN_LIGHT,  life = 0.45, width = 0.30, glow = 1,    phase = 4.4 },
+	{ r = 0.74, speed = 6.2,  color = CONFIG.GREEN, life = 0.40, width = 0.28, glow = 0.8,  phase = 2.2 },
+	{ r = 0.62, speed = -7.4, color = GREEN_DARK,   life = 0.40, width = 0.34, glow = 0.15, phase = 5.1 },
+	{ r = 0.50, speed = 8.6,  color = GREEN_DARK,   life = 0.35, width = 0.30, glow = 0.15, phase = 0.7 },
+}
+
+-- Rim of the portal: soft halo + coloured band + white-hot edge, each with a moving gradient.
+local RIM_DEFS = {
+	{ frac = 0.74, thick = 40, tr = 0.72, gspeed = 60,
+		grad = cseq(0, GREEN_DARK, 0.5, CONFIG.GREEN, 1, GREEN_DARK) },
+	{ frac = 0.74, thick = 16, tr = 0.35, gspeed = -110,
+		grad = cseq(0, CONFIG.GREEN, 0.35, GREEN_LIGHT, 0.7, CONFIG.GREEN, 1, CONFIG.GREEN) },
+	{ frac = 0.74, thick = 6, tr = 0,    gspeed = 150,
+		grad = cseq(0, WHITE, 0.3, GREEN_LIGHT, 0.55, WHITE, 0.8, GREEN_LIGHT, 1, WHITE) },
+}
+
+--[[
+	cfg.cframe   : CFrame, LookVector = direction the portal faces
+	cfg.origin   : Vector3 (optional) - where the glowing ball is shot from
+	cfg.onEnter  : function(portal) -> boolean (optional) - makes the portal usable;
+	               return true when the player was actually teleported
+]]
+local function createPortal(cfg)
+	local cf = cfg.cframe
+	local pos = cf.Position
+	local size = CONFIG.PORTAL_SIZE
+	local radius = size / 2
+
+	local portal = {
+		open = false, armed = false, closed = false, used = false, busy = false,
+		closing = false, emitting = false, openedAt = nil, closeAt = nil,
+	}
+	activePortals[portal] = true
+
+	local model = Instance.new("Folder")
+	model.Name = "Portal"
+	model.Parent = fx
+
+	local scaleValue = Instance.new("NumberValue")
+	scaleValue.Name = "Scale"
+	scaleValue.Value = 0
+	scaleValue.Parent = model
+
+	-- Image part: three counter-rotating layers of the portal image on both faces
+	local core = newFxPart(Vector3.new(size, size, 0.1), cf)
+	core.Name = "PortalImage"
+	core.Parent = model
+
+	local layers = {}
+	for idx, def in ipairs(LAYER_DEFS) do
+		layers[idx] = { def = def, rot = (idx - 1) * 70, imgs = {} }
+	end
+	for _, face in ipairs({ Enum.NormalId.Front, Enum.NormalId.Back }) do
+		local sg = Instance.new("SurfaceGui")
+		sg.Face = face
+		sg.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+		sg.CanvasSize = Vector2.new(768, 768)
+		sg.LightInfluence = 0
+		sg.Brightness = 2.2
+		sg.Adornee = core
+		sg.Parent = core
+
+		for idx, layer in ipairs(layers) do
+			local img = Instance.new("ImageLabel")
+			img.AnchorPoint = Vector2.new(0.5, 0.5)
+			img.Position = UDim2.fromScale(0.5, 0.5)
+			img.Size = UDim2.fromScale(0, 0)
+			img.BackgroundTransparency = 1
+			img.Image = CONFIG.PORTAL_IMAGE
+			img.ImageTransparency = layer.def.transparency
+			img.ScaleType = Enum.ScaleType.Fit
+			img.ZIndex = idx
+			img.Parent = sg
+			table.insert(layer.imgs, img)
+		end
+	end
+
+	-- Glowing rim (slightly thicker slab so it never z-fights with the image)
+	local rim = newFxPart(Vector3.new(size * 1.3, size * 1.3, 0.14), cf)
+	rim.Name = "PortalRim"
+	rim.Parent = model
+
+	local rimRings = {}
+	for _, face in ipairs({ Enum.NormalId.Front, Enum.NormalId.Back }) do
+		local sg = Instance.new("SurfaceGui")
+		sg.Face = face
+		sg.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+		sg.CanvasSize = Vector2.new(512, 512)
+		sg.LightInfluence = 0
+		sg.Brightness = 3
+		sg.Adornee = rim
+		sg.Parent = rim
+
+		for idx, def in ipairs(RIM_DEFS) do
+			local f = Instance.new("Frame")
+			f.AnchorPoint = Vector2.new(0.5, 0.5)
+			f.Position = UDim2.fromScale(0.5, 0.5)
+			f.Size = UDim2.fromScale(0, 0)
+			f.BackgroundTransparency = 1
+			f.BorderSizePixel = 0
+			f.ZIndex = idx
+			f.Parent = sg
+
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(0.5, 0)
+			corner.Parent = f
+
+			local stroke = Instance.new("UIStroke")
+			stroke.Color = WHITE
+			stroke.Thickness = 0
+			stroke.Transparency = def.tr
+			stroke.Parent = f
+
+			local gradient = Instance.new("UIGradient")
+			gradient.Color = def.grad
+			gradient.Parent = stroke
+
+			table.insert(rimRings, { frame = f, stroke = stroke, gradient = gradient, def = def, phase = idx * 1.7 })
+		end
+	end
+
+	-- Glow disc sandwiched inside the image slab (pulses dark green <-> bright green)
+	local glow = newFxPart(Vector3.new(0.04, size, size), cf * CFrame.Angles(0, math.rad(90), 0))
+	glow.Shape = Enum.PartType.Cylinder
+	glow.Material = Enum.Material.Neon
+	glow.Color = CONFIG.GREEN
+	glow.Transparency = 0.8
+	glow.Parent = model
+
+	-- Light
+	local light = Instance.new("PointLight")
+	light.Color = CONFIG.GREEN
+	light.Range = 27
+	light.Brightness = 0
+	light.Parent = core
+
+	-- Orbiting light ribbons (white / light green / dark green)
+	local orbiters = {}
+	for i, def in ipairs(ORBITS) do
+		local startPos = pos + cf.RightVector * (math.cos(def.phase) * radius * def.r)
+			+ cf.UpVector * (math.sin(def.phase) * radius * def.r)
+		local part = newFxPart(Vector3.one * 0.2, CFrame.new(startPos))
+		part.Parent = model
+		local trail = makeTrail(part, def.color, def.life, def.width, def.glow)
+		trail.Enabled = false
+		orbiters[i] = { part = part, trail = trail, def = def, ang = def.phase, r = def.r, speed = def.speed, phase = def.phase }
+	end
+
+	-- Emitters. Positions are randomised per frame in the Heartbeat below.
+	local rimHolder = newFxPart(Vector3.one * 0.2, cf)
+	rimHolder.Parent = model
+	local suckHolder = newFxPart(Vector3.one * 0.2, cf)
+	suckHolder.Parent = model
+	local faceHolder = newFxPart(Vector3.one * 0.2, cf)
+	faceHolder.Parent = model
+
+	local k = size / 6.5 -- particle size multiplier vs. the original portal
+
+	-- sparks spraying off the rim (white -> light green -> green)
+	local rimSparks = newEmitter(rimHolder, {
+		Texture = SPARK_TEX,
+		Color = cseq(0, WHITE, 0.4, GREEN_LIGHT, 1, CONFIG.GREEN),
+		LightEmission = 1,
+		Size = seq(0, 0.55, 0.5, 0.3, 1, 0),
+		Transparency = seq(0, 0, 0.7, 0.2, 1, 1),
+		Lifetime = NumberRange.new(0.5, 1.1),
+		Speed = NumberRange.new(2, 8),
+		SpreadAngle = Vector2.new(35, 35),
+		EmissionDirection = Enum.NormalId.Top,
+		Drag = 1.5,
+		Acceleration = Vector3.new(0, 2.5, 0),
+		Rotation = NumberRange.new(0, 360),
+	})
+
+	-- soft glowing blobs along the rim
+	local rimGlow = newEmitter(rimHolder, {
+		Texture = GLOW_TEX,
+		Color = cseq(0, WHITE, 0.3, GREEN_LIGHT, 1, GREEN_DARK),
+		LightEmission = 1,
+		Size = seq(0, 0.8 * k, 1, 2.6 * k),
+		Transparency = seq(0, 1, 0.15, 0.5, 1, 1),
+		Lifetime = NumberRange.new(0.5, 0.9),
+		Speed = NumberRange.new(0.5, 2.5),
+		SpreadAngle = Vector2.new(60, 60),
+		EmissionDirection = Enum.NormalId.Top,
+		Rotation = NumberRange.new(0, 360),
+		RotSpeed = NumberRange.new(-60, 60),
+	})
+
+	-- glints getting pulled into the portal
+	local suck = newEmitter(suckHolder, {
+		Texture = SPARK_TEX,
+		Color = ColorSequence.new(WHITE, GREEN_LIGHT),
+		LightEmission = 1,
+		Size = seq(0, 0.45, 0.8, 0.3, 1, 0),
+		Transparency = seq(0, 1, 0.15, 0, 0.8, 0.2, 1, 1),
+		Lifetime = NumberRange.new(0.35, 0.55),
+		Speed = NumberRange.new(8, 14),
+		SpreadAngle = Vector2.new(8, 8),
+		EmissionDirection = Enum.NormalId.Bottom,
+		Rotation = NumberRange.new(0, 360),
+	})
+
+	-- bright mist drifting out of the portal face
+	local mist = newEmitter(faceHolder, {
+		Texture = SMOKE_TEX,
+		Color = cseq(0, GREEN_LIGHT, 0.5, CONFIG.GREEN, 1, GREEN_DARK),
+		LightEmission = 0.55,
+		Size = seq(0, 1.8 * k, 1, 5 * k),
+		Transparency = seq(0, 1, 0.2, 0.62, 1, 1),
+		Lifetime = NumberRange.new(1.0, 1.6),
+		Speed = NumberRange.new(0.8, 2.5),
+		SpreadAngle = Vector2.new(25, 25),
+		EmissionDirection = Enum.NormalId.Front,
+		Rotation = NumberRange.new(0, 360),
+		RotSpeed = NumberRange.new(-60, 60),
+	})
+
+	-- dark green wisps for depth (no glow, so they read as shadowy smoke)
+	local dark = newEmitter(faceHolder, {
+		Texture = SMOKE_TEX,
+		Color = cseq(0, GREEN_DARK, 1, Color3.fromRGB(4, 40, 18)),
+		LightEmission = 0,
+		Size = seq(0, 2 * k, 1, 6 * k),
+		Transparency = seq(0, 1, 0.25, 0.55, 1, 1),
+		Lifetime = NumberRange.new(1.2, 1.9),
+		Speed = NumberRange.new(0.5, 2),
+		SpreadAngle = Vector2.new(30, 30),
+		EmissionDirection = Enum.NormalId.Front,
+		Rotation = NumberRange.new(0, 360),
+		RotSpeed = NumberRange.new(-40, 40),
+	})
+
+	-- tiny glowing white motes floating off the face
+	local motes = newEmitter(faceHolder, {
+		Texture = SPARK_TEX,
+		Color = ColorSequence.new(WHITE, GREEN_LIGHT),
+		LightEmission = 1,
+		Size = seq(0, 0.35, 0.5, 0.28, 1, 0),
+		Transparency = seq(0, 0, 0.7, 0.25, 1, 1),
+		Lifetime = NumberRange.new(0.8, 1.5),
+		Speed = NumberRange.new(1, 3.5),
+		SpreadAngle = Vector2.new(35, 35),
+		EmissionDirection = Enum.NormalId.Front,
+		Acceleration = Vector3.new(0, 1.5, 0),
+		Rotation = NumberRange.new(0, 360),
+	})
+
+	-- Invisible trigger part IN FRONT of the image: this is the real portal
+	local trigger
+	if cfg.onEnter then
+		trigger = newFxPart(Vector3.new(size * 0.7, size * 0.92, 2.4), cf * CFrame.new(0, 0, -1.3))
+		trigger.Name = "PortalTrigger"
+		trigger.CanTouch = true
+		trigger.Parent = model
+	end
+
+	local function tryEnter()
+		if portal.closed or portal.used or portal.busy or not portal.armed or not cfg.onEnter then
+			return
+		end
+		portal.busy = true
+		local ok = cfg.onEnter(portal)
+		if ok then
+			portal.used = true
+			portal.close(CONFIG.CLOSE_DELAY)
+		else
+			task.delay(1.2, function()
+				portal.busy = false
+			end)
+		end
+	end
+
+	if trigger then
+		trigger.Touched:Connect(function(hit)
+			local char = player.Character
+			if char and hit:IsDescendantOf(char) then
+				tryEnter()
+			end
+		end)
+	end
+
+	-- Electric filament flicking between two points on the rim
+	local function arc()
+		local a1 = math.random() * math.pi * 2
+		local a2 = a1 + math.rad(rand(70, 160)) * ((math.random() < 0.5) and 1 or -1)
+		local function rimPoint(a)
+			return pos + (cf.RightVector * math.cos(a) + cf.UpVector * math.sin(a)) * (radius * 0.92) + cf.LookVector * 0.2
+		end
+
+		local at0 = Instance.new("Attachment")
+		at0.Parent = core
+		at0.WorldPosition = rimPoint(a1)
+		local at1 = Instance.new("Attachment")
+		at1.Parent = core
+		at1.WorldPosition = rimPoint(a2)
+
+		local beam = Instance.new("Beam")
+		beam.Attachment0 = at0
+		beam.Attachment1 = at1
+		beam.Color = cseq(0, WHITE, 0.5, GREEN_LIGHT, 1, WHITE)
+		beam.LightEmission = 1
+		beam.LightInfluence = 0
+		beam.FaceCamera = true
+		beam.Segments = 14
+		beam.Width0 = 0.28
+		beam.Width1 = 0.28
+		beam.CurveSize0 = rand(-1, 1) * radius * 0.5
+		beam.CurveSize1 = rand(-1, 1) * radius * 0.5
+		beam.Transparency = NumberSequence.new(0.1)
+		beam.Parent = core
+		tween(beam, 0.16, { Width0 = 0, Width1 = 0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		Debris:AddItem(beam, 0.25)
+		Debris:AddItem(at0, 0.25)
+		Debris:AddItem(at1, 0.25)
+	end
+
+	-- Emission helper: how many particles are due this frame
+	local acc = {}
+	local function due(name, perSecond, dt)
+		local v = (acc[name] or 0) + perSecond * dt
+		local n = math.floor(v)
+		acc[name] = v - n
+		return n
+	end
+
+	-- Per-frame animation
+	local t0 = os.clock()
+	local last = t0
+	local nextRing = 0
+	local nextArc = 0
+	local ringIndex = 0
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not core.Parent then
+			conn:Disconnect()
+			return
+		end
+		local now = os.clock()
+		local dt = math.min(now - last, 0.1)
+		last = now
+		local t = now - t0
+		local s = scaleValue.Value
+		local sPos = math.max(s, 0)
+		local sClamp = math.min(sPos, 1)
+
+		-- the swirl whirls extra fast while opening and closing
+		local boost = 1
+		if portal.openedAt then
+			boost += 3.2 * math.exp(-(now - portal.openedAt) * 4.5)
+		end
+		if portal.closeAt then
+			boost += 5 * math.clamp((now - portal.closeAt) / 0.35, 0, 1)
+		end
+
+		-- image layers
+		local pulse = 0.93 + 0.05 * math.sin(t * 6.2) + 0.02 * math.sin(t * 13.1)
+		local px = s * pulse
+		for _, layer in ipairs(layers) do
+			layer.rot = (layer.rot + dt * CONFIG.SPIN_SPEED * layer.def.spin * boost) % 360
+			local lp = math.max(px * layer.def.scale, 0)
+			for _, img in ipairs(layer.imgs) do
+				img.Size = UDim2.fromScale(lp, lp)
+				img.Rotation = layer.rot
+			end
+		end
+
+		-- rim
+		for _, rr in ipairs(rimRings) do
+			local fs = rr.def.frac * sPos
+			rr.frame.Size = UDim2.fromScale(fs, fs)
+			rr.stroke.Thickness = rr.def.thick * sClamp * (0.85 + 0.15 * math.sin(t * 8 + rr.phase))
+			rr.stroke.Transparency = math.clamp(rr.def.tr + 0.1 * math.sin(t * 6 + rr.phase), 0, 1)
+			rr.gradient.Rotation = (t * rr.def.gspeed) % 360
+		end
+
+		-- glow disc + light (dark green <-> bright green)
+		local wave = 0.5 + 0.5 * math.sin(t * 3.4)
+		local glowSize = math.max(size * 0.95 * px, 0.05)
+		glow.Size = Vector3.new(0.04, glowSize, glowSize)
+		glow.Color = GREEN_DARK:Lerp(CONFIG.GREEN, wave)
+		glow.Transparency = 0.78 + 0.1 * math.sin(t * 7)
+		light.Brightness = 4 * sPos * (0.85 + 0.15 * math.sin(t * 9))
+		light.Color = CONFIG.GREEN:Lerp(GREEN_LIGHT, wave * 0.6)
+
+		-- orbiting ribbons
+		local showTrails = portal.emitting and sPos > 0.2
+		for _, o in ipairs(orbiters) do
+			o.ang += dt * o.speed * (0.6 + 0.4 * boost)
+			local r = radius * o.r * sPos * (1 + 0.05 * math.sin(t * 7 + o.phase))
+			o.part.CFrame = CFrame.new(
+				pos
+					+ cf.RightVector * (math.cos(o.ang) * r)
+					+ cf.UpVector * (math.sin(o.ang) * r)
+					+ cf.LookVector * 0.15
+			)
+			o.trail.Enabled = showTrails
+		end
+
+		-- particles + ring pulses + arcs
+		if portal.emitting and sClamp > 0.15 then
+			-- rim sparks / glow blobs (one random spot on the rim per frame)
+			local nSp = due("sp", 70 * sClamp, dt)
+			local nGl = due("gl", 24 * sClamp, dt)
+			if nSp + nGl > 0 then
+				local ang = math.random() * math.pi * 2
+				local c, sn = math.cos(ang), math.sin(ang)
+				local out = cf.RightVector * c + cf.UpVector * sn
+				local tangent = cf.RightVector * -sn + cf.UpVector * c
+				rimHolder.CFrame = CFrame.fromMatrix(pos + out * (radius * 0.95 * sPos), tangent, out)
+				if nSp > 0 then rimSparks:Emit(nSp) end
+				if nGl > 0 then rimGlow:Emit(nGl) end
+			end
+
+			-- glints sucked in from outside the rim
+			local nSu = due("su", 32 * sClamp, dt)
+			if nSu > 0 then
+				local ang = math.random() * math.pi * 2
+				local c, sn = math.cos(ang), math.sin(ang)
+				local out = cf.RightVector * c + cf.UpVector * sn
+				local tangent = cf.RightVector * -sn + cf.UpVector * c
+				suckHolder.CFrame = CFrame.fromMatrix(pos + out * (radius * rand(1.2, 1.5)), tangent, out)
+				suck:Emit(nSu)
+			end
+
+			-- mist / dark wisps / motes from a random spot on the face
+			local nMi = due("mi", 18 * sClamp, dt)
+			local nDa = due("da", 9 * sClamp, dt)
+			local nMo = due("mo", 22 * sClamp, dt)
+			if nMi + nDa + nMo > 0 then
+				local ang = math.random() * math.pi * 2
+				local rr = radius * 0.85 * math.sqrt(math.random())
+				faceHolder.CFrame = cf * CFrame.new(math.cos(ang) * rr, math.sin(ang) * rr, -0.1)
+				if nMi > 0 then mist:Emit(nMi) end
+				if nDa > 0 then dark:Emit(nDa) end
+				if nMo > 0 then motes:Emit(nMo) end
+			end
+		end
+
+		if portal.open and not portal.closed then
+			if t >= nextRing then
+				nextRing = t + 0.45
+				ringIndex += 1
+				ringEffect(
+					cf * CFrame.new(0, 0, -0.16),
+					size * 1.35,
+					(ringIndex % 2 == 0) and WHITE or GREEN_LIGHT,
+					0.9, 0.55, 5
+				)
+			end
+			if t >= nextArc then
+				nextArc = t + rand(0.1, 0.3)
+				arc()
+			end
+		end
+
+		-- trigger polling fallback
+		if trigger and portal.armed and not portal.used and not portal.closed then
+			local root = getRoot(player)
+			if root then
+				local rel = trigger.CFrame:PointToObjectSpace(root.Position)
+				local half = trigger.Size / 2
+				if math.abs(rel.X) <= half.X and math.abs(rel.Y) <= half.Y and math.abs(rel.Z) <= half.Z then
+					tryEnter()
+				end
+			end
+		end
+	end)
+
+	local function doClose()
+		if portal.closed then return end
+		portal.closed = true
+		portal.open = false
+		portal.armed = false
+		portal.emitting = false
+		portal.closeAt = os.clock()
+		activePortals[portal] = nil
+		playSoundAt(CONFIG.SOUND_PORTAL, pos, 0.8, 0.9)
+
+		-- implosion: collapsing ring + sparks sucked into the centre
+		ringEffect(cf * CFrame.new(0, 0, -0.1), size * 1.3, WHITE, 0.35, 0.86, 8, 0.1, Enum.EasingDirection.In)
+		rimBurst(cf, radius * 1.2, true, 3)
+		tween(scaleValue, 0.34, { Value = 0 }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+
+		task.delay(2.2, function()
+			conn:Disconnect()
+			model:Destroy()
+		end)
+	end
+
+	function portal.close(delay)
+		if portal.closed then return end
+		if delay and delay > 0 then
+			if portal.closing then return end
+			portal.closing = true
+			task.delay(delay, doClose)
+		else
+			doClose()
+		end
+	end
+
+	-- Opening sequence: glowing ball -> flash -> portal whirls open
+	task.spawn(function()
+		local ball = newFxPart(Vector3.one * 1.0, CFrame.new(cfg.origin or pos))
+		ball.Shape = Enum.PartType.Ball
+		ball.Material = Enum.Material.Neon
+		ball.Color = Color3.fromRGB(230, 255, 235)
+		ball.Transparency = 0
+		ball.Parent = fx
+
+		local aura = newFxPart(Vector3.one * 2.0, ball.CFrame)
+		aura.Shape = Enum.PartType.Ball
+		aura.Material = Enum.Material.Neon
+		aura.Color = CONFIG.GREEN
+		aura.Transparency = 0.7
+		aura.Parent = fx
+
+		local ballLight = Instance.new("PointLight")
+		ballLight.Color = CONFIG.GREEN
+		ballLight.Range = 16
+		ballLight.Brightness = 4
+		ballLight.Parent = ball
+
+		local ballTrail = makeTrail(ball, GREEN_LIGHT, 0.22, 0.8, 1)
+
+		local ballSparks = newEmitter(ball, {
+			Texture = SPARK_TEX,
+			Color = ColorSequence.new(WHITE, CONFIG.GREEN),
+			LightEmission = 1,
+			Size = seq(0, 0.6, 1, 0),
+			Transparency = seq(0, 0, 1, 1),
+			Lifetime = NumberRange.new(0.3, 0.5),
+			Speed = NumberRange.new(0, 2),
+			SpreadAngle = Vector2.new(180, 180),
+			Rotation = NumberRange.new(0, 360),
+			Rate = 90,
+		})
+
+		if cfg.origin then
+			local flight = tween(ball, 0.14, { Position = pos }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			tween(aura, 0.14, { Position = pos }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			flight.Completed:Wait()
+		else
+			ball.Size = Vector3.one * 0.2
+			aura.Size = Vector3.one * 0.4
+			tween(aura, 0.1, { Size = Vector3.one * 2.0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			local grow = tween(ball, 0.1, { Size = Vector3.one * 1.0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			grow.Completed:Wait()
+		end
+
+		if portal.closed then
+			ball:Destroy()
+			aura:Destroy()
+			return
+		end
+
+		ballTrail.Enabled = false
+		ballSparks.Enabled = false
+		portal.emitting = true
+		portal.openedAt = os.clock()
+		playSoundAt(CONFIG.SOUND_PORTAL, pos, 1)
+
+		-- opening flourish
+		local front = cf * CFrame.new(0, 0, -0.12)
+		discFlash(cf * CFrame.new(0, 0, -0.24), size * 1.6, WHITE, 0.4, 0.05)
+		discFlash(cf * CFrame.new(0, 0, -0.3), size * 2.0, CONFIG.GREEN, 0.6, 0.45)
+		ringEffect(front, size * 1.9, WHITE, 0.5, 0.2, 12)
+		ringEffect(front, size * 1.5, GREEN_LIGHT, 0.7, 0.1, 9)
+		rimBurst(cf, radius * 0.95, false, 4)
+
+		tween(ballLight, 0.5, { Brightness = 0 })
+		tween(ball, 0.38, { Size = Vector3.one * size * 0.8, Transparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		tween(aura, 0.5, { Size = Vector3.one * size * 1.25, Transparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		tween(scaleValue, 0.42, { Value = 1 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		Debris:AddItem(ball, 0.7)
+		Debris:AddItem(aura, 0.7)
+
+		task.wait(0.42)
+		if portal.closed then return end
+		portal.open = true
+
+		task.wait(0.25)
+		if portal.closed then return end
+		portal.armed = true
+	end)
+
+	return portal
+end
+
+
+------------------------------------------------------------------------
+-- ABILITIES
+------------------------------------------------------------------------
+
+-- BLUE: instant teleport to the nearest player
+local tpCooldown = false
+local function instantTeleport()
+	if tpCooldown then return end
+	local root, _, char = getRoot(player)
+	if not root then return end
+
+	local best, bestDist
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player then
+			local oRoot = getRoot(other)
+			if oRoot then
+				local d = (oRoot.Position - root.Position).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = oRoot, d
+				end
+			end
+		end
+	end
+
+	if not best then
+		notify("No other players to teleport to")
+		return
+	end
+
+	tpCooldown = true
+	task.delay(0.4, function()
+		tpCooldown = false
+	end)
+
+	local origin = root.Position
+	local tPos = best.Position
+	local back = -Vector3.new(best.CFrame.LookVector.X, 0, best.CFrame.LookVector.Z)
+	back = back.Magnitude > 0.01 and back.Unit or Vector3.new(0, 0, 1)
+
+	-- land 4 studs behind them, but never inside a wall
+	local dist = 4
+	local wall = Workspace:Raycast(tPos, back * 6, makeRayParams())
+	if wall then
+		dist = math.max(wall.Distance - 1.5, 1.5)
+	end
+	local dest = tPos + back * dist
+
+	-- departure
+	playSoundAt(CONFIG.SOUND_TP, origin, 1)
+	screenFlash(CONFIG.BLUE, 0.15, 0.55)
+	fovPop(22, 0.07, 0.6)
+	departFx(origin, CONFIG.BLUE)
+	warpBeam(origin, dest, CONFIG.BLUE)
+
+	-- teleport
+	root.CFrame = CFrame.lookAt(dest, Vector3.new(tPos.X, dest.Y, tPos.Z))
+	root.AssemblyLinearVelocity = Vector3.zero
+
+	-- arrival
+	playSoundAt(CONFIG.SOUND_TP, dest, 1)
+	teleportFx(dest, CONFIG.BLUE, char)
+end
+
+-- Used by Portal Mode: step through -> come out 20 studs behind the target
+local function enterThroughPortal(targetPlayer)
+	local root, _, char = getRoot(player)
+	if not root then return false end
+	local tRoot = getRoot(targetPlayer)
+	if not tRoot or targetPlayer.Parent ~= Players then
+		notify("Target is no longer available")
+		return false
+	end
+
+	local tPos = tRoot.Position
+	local back = -Vector3.new(tRoot.CFrame.LookVector.X, 0, tRoot.CFrame.LookVector.Z)
+	back = back.Magnitude > 0.01 and back.Unit or Vector3.new(0, 0, 1)
+
+	-- shorten if a wall is in the way
+	local dist = CONFIG.BEHIND_DISTANCE
+	local wall = Workspace:Raycast(tPos, back * (dist + 4), makeRayParams())
+	if wall then
+		dist = math.max(wall.Distance - 7, 2.5)
+	end
+
+	local facing = -back -- exit portal + player face the target
+	local arrival = tPos + back * dist
+	local exitPos = arrival + back * 4.5 + Vector3.new(0, PORTAL_LIFT, 0) -- portal sits just behind where you appear
+	local entryPos = root.Position
+
+	-- walked through
+	playSoundAt(CONFIG.SOUND_ENTER, entryPos, 1)
+	screenFlash(CONFIG.GREEN, 0.4, 0.55)
+	departFx(entryPos, CONFIG.GREEN)
+
+	local exitPortal = createPortal({
+		cframe = CFrame.lookAt(exitPos, exitPos + facing),
+	})
+	exitPortal.close(CONFIG.CLOSE_DELAY)
+
+	root.CFrame = CFrame.lookAt(arrival, arrival + facing)
+	root.AssemblyLinearVelocity = Vector3.zero
+	teleportFx(arrival, CONFIG.GREEN, char)
+	return true
+end
+
+-- RED (after picking a target): shoot a portal
+local function shootPortal(targetPlayer)
+	local root = getRoot(player)
+	if not root then return end
+	if not getRoot(targetPlayer) then
+		notify("That player isn't available")
+		return
+	end
+
+	closeAllPortals()
+
+	local origin = root.Position
+	local flatLook = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+	if flatLook.Magnitude < 0.01 then
+		flatLook = Vector3.new(0, 0, -1)
+	end
+	flatLook = flatLook.Unit
+
+	-- check feet / waist / head height for a wall
+	local params = makeRayParams()
+	local nearest
+	for _, yOff in ipairs({ -2, 0, 2.5 }) do
+		local o = origin + Vector3.new(0, yOff, 0)
+		local result = Workspace:Raycast(o, flatLook * (CONFIG.SHOOT_DISTANCE + 0.4), params)
+		if result and (not nearest or result.Distance < nearest.Distance) then
+			nearest = result
+		end
+	end
+
+	local pos, facing
+	if nearest then
+		local n = Vector3.new(nearest.Normal.X, 0, nearest.Normal.Z)
+		n = n.Magnitude < 0.2 and -flatLook or n.Unit
+		pos = Vector3.new(nearest.Position.X, origin.Y + 0.3 + PORTAL_LIFT, nearest.Position.Z) + n * 0.4
+		facing = n
+	else
+		pos = origin + flatLook * CONFIG.SHOOT_DISTANCE + Vector3.new(0, 0.3 + PORTAL_LIFT, 0)
+		facing = -flatLook
+	end
+
+	createPortal({
+		cframe = CFrame.lookAt(pos, pos + facing),
+		origin = origin + flatLook * 1.0,
+		onEnter = function()
+			return enterThroughPortal(targetPlayer)
+		end,
+	})
+end
+
+-- GREEN: portal under you, fall through, land 90 studs to the left
+local safeBusy = false
+local function safeTeleport()
+	if safeBusy then return end
+	local root, hum, char = getRoot(player)
+	if not root then return end
+	safeBusy = true
+
+	closeAllPortals()
+
+	local startCF = root.CFrame
+	local startPos = startCF.Position
+
+	-- find the floor under us
+	local floorHit = Workspace:Raycast(startPos, Vector3.new(0, -12, 0), makeRayParams())
+	local rootHeight = (hum.RigType == Enum.HumanoidRigType.R15) and (hum.HipHeight + root.Size.Y / 2) or 3
+	local floorPos = floorHit and floorHit.Position or (startPos - Vector3.new(0, rootHeight, 0))
+
+	local entry = createPortal({
+		cframe = flatCF(floorPos + Vector3.new(0, 0.12, 0)),
+	})
+
+	-- remember collisions so we can restore them after falling through the floor
+	local saved = {}
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") then
+			saved[part] = part.CanCollide
+		end
+	end
+	local noclipConn
+
+	local function restore()
+		if noclipConn then
+			noclipConn:Disconnect()
+			noclipConn = nil
+		end
+		for part, value in pairs(saved) do
+			if part.Parent then
+				part.CanCollide = value
+			end
+		end
+		if hum.Parent then
+			hum.PlatformStand = false
+			hum:ChangeState(Enum.HumanoidStateType.Freefall)
+		end
+		safeBusy = false
+	end
+
+	-- wait for the portal to finish opening
+	while not entry.open and not entry.closed do
+		task.wait()
+	end
+	if entry.closed or not root.Parent or hum.Health <= 0 then
+		entry.close(0)
+		safeBusy = false
+		return
+	end
+
+	-- fall through the floor
+	noclipConn = RunService.Stepped:Connect(function()
+		for part in pairs(saved) do
+			if part.Parent then
+				part.CanCollide = false
+			end
+		end
+	end)
+	hum.PlatformStand = true
+	root.AssemblyLinearVelocity = Vector3.new(0, -6, 0)
+
+	local fallStart = os.clock()
+	while root.Parent and hum.Health > 0 and root.Position.Y > floorPos.Y - 1.2 and os.clock() - fallStart < 1.6 do
+		RunService.Heartbeat:Wait()
+	end
+
+	if not root.Parent or hum.Health <= 0 then
+		restore()
+		entry.close(0)
+		return
+	end
+
+	-- we went through the portal
+	playSoundAt(CONFIG.SOUND_ENTER, floorPos, 1)
+	screenFlash(CONFIG.GREEN, 0.4, 0.55)
+	departFx(floorPos + Vector3.new(0, 3, 0), CONFIG.GREEN)
+	entry.used = true
+	entry.close(CONFIG.CLOSE_DELAY)
+
+	-- destination: 90 studs to the left, snapped to the ground
+	local left = -startCF.RightVector
+	left = Vector3.new(left.X, 0, left.Z).Unit
+	local destFlat = startPos + left * CONFIG.SAFE_TP_DISTANCE
+	local down = Workspace:Raycast(Vector3.new(destFlat.X, startPos.Y + 8, destFlat.Z), Vector3.new(0, -80, 0), makeRayParams())
+	local destRootPos = down and (down.Position + Vector3.new(0, rootHeight + 0.4, 0)) or destFlat
+	local destFloor = destRootPos - Vector3.new(0, rootHeight, 0)
+
+	root.CFrame = CFrame.new(destRootPos) * startCF.Rotation
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+
+	local exitPortal = createPortal({
+		cframe = flatCF(destFloor + Vector3.new(0, 0.12, 0)),
+	})
+	exitPortal.close(CONFIG.CLOSE_DELAY)
+
+	teleportFx(destRootPos, CONFIG.GREEN, char)
+	restore()
+end
+
+------------------------------------------------------------------------
+-- LEFT-SIDE BUTTONS
+------------------------------------------------------------------------
+local BUTTON_SIZE = 46
+
+local bar = Instance.new("Frame")
+bar.Name = "ButtonBar"
+bar.AnchorPoint = Vector2.new(0, 0.5)
+bar.Position = UDim2.new(0, 14, 0.5, 0)
+bar.Size = UDim2.fromOffset(BUTTON_SIZE, BUTTON_SIZE * 3 + 10 * 2)
+bar.BackgroundTransparency = 1
+bar.Parent = gui
+
+do
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Vertical
+	layout.Padding = UDim.new(0, 10)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = bar
+end
+
+local function makeButton(name, label, color, order, tip, callback)
+	local btn = Instance.new("TextButton")
+	btn.Name = name
+	btn.LayoutOrder = order
+	btn.Size = UDim2.fromOffset(BUTTON_SIZE, BUTTON_SIZE)
+	btn.BackgroundColor3 = color
+	btn.AutoButtonColor = false
+	btn.Text = label
+	btn.TextColor3 = Color3.new(1, 1, 1)
+	btn.TextStrokeTransparency = 0.75
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 12
+	btn.Parent = bar
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 12)
+	corner.Parent = btn
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.new(1, 1, 1)
+	stroke.Transparency = 0.55
+	stroke.Thickness = 1.5
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = btn
+
+	local scale = Instance.new("UIScale")
+	scale.Parent = btn
+
+	local tipLabel = Instance.new("TextLabel")
+	tipLabel.AnchorPoint = Vector2.new(0, 0.5)
+	tipLabel.Position = UDim2.new(1, 10, 0.5, 0)
+	tipLabel.AutomaticSize = Enum.AutomaticSize.X
+	tipLabel.Size = UDim2.fromOffset(0, 26)
+	tipLabel.BackgroundColor3 = Color3.fromRGB(15, 15, 18)
+	tipLabel.BackgroundTransparency = 0.15
+	tipLabel.Text = tip
+	tipLabel.TextColor3 = Color3.new(1, 1, 1)
+	tipLabel.Font = Enum.Font.GothamMedium
+	tipLabel.TextSize = 13
+	tipLabel.Visible = false
+	tipLabel.Parent = btn
+	do
+		local pad = Instance.new("UIPadding")
+		pad.PaddingLeft = UDim.new(0, 10)
+		pad.PaddingRight = UDim.new(0, 10)
+		pad.Parent = tipLabel
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 8)
+		c.Parent = tipLabel
+	end
+
+	local function tweenScale(v)
+		TweenService:Create(scale, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = v }):Play()
+	end
+	btn.MouseEnter:Connect(function()
+		tweenScale(1.1)
+		tipLabel.Visible = true
+	end)
+	btn.MouseLeave:Connect(function()
+		tweenScale(1)
+		tipLabel.Visible = false
+	end)
+	btn.MouseButton1Down:Connect(function()
+		tweenScale(0.92)
+	end)
+	btn.MouseButton1Up:Connect(function()
+		tweenScale(1.1)
+	end)
+	btn.Activated:Connect(callback)
+
+	return btn, stroke
+end
+
+------------------------------------------------------------------------
+-- PORTAL MODE PLAYER PANEL (smooth green UI)
+------------------------------------------------------------------------
+local panel = Instance.new("CanvasGroup")
+panel.Name = "PlayerPanel"
+panel.AnchorPoint = Vector2.new(0, 0.5)
+panel.Position = UDim2.new(0, 76, 0.5, 0)
+panel.Size = UDim2.fromOffset(250, 300)
+panel.BackgroundColor3 = Color3.fromRGB(10, 22, 14)
+panel.BackgroundTransparency = 0.05
+panel.GroupTransparency = 1
+panel.Visible = false
+panel.ZIndex = 10
+panel.Parent = gui
+
+local panelScale = Instance.new("UIScale")
+panelScale.Scale = 0.85
+panelScale.Parent = panel
+
+do
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 16)
+	corner.Parent = panel
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = CONFIG.GREEN
+	stroke.Thickness = 2
+	stroke.Transparency = 0.2
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = panel
+
+	local grad = Instance.new("UIGradient")
+	grad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(200, 235, 210))
+	grad.Rotation = 90
+	grad.Parent = panel
+end
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(16, 12)
+title.Size = UDim2.new(1, -32, 0, 20)
+title.Font = Enum.Font.GothamBold
+title.Text = "PORTAL TARGET"
+title.TextSize = 15
+title.TextColor3 = CONFIG.GREEN
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = panel
+
+local subtitle = Instance.new("TextLabel")
+subtitle.BackgroundTransparency = 1
+subtitle.Position = UDim2.fromOffset(16, 32)
+subtitle.Size = UDim2.new(1, -32, 0, 16)
+subtitle.Font = Enum.Font.Gotham
+subtitle.Text = "Pick a player to open a portal to"
+subtitle.TextSize = 12
+subtitle.TextColor3 = Color3.fromRGB(130, 190, 150)
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.Parent = panel
+
+local list = Instance.new("ScrollingFrame")
+list.Name = "List"
+list.BackgroundTransparency = 1
+list.BorderSizePixel = 0
+list.Position = UDim2.new(0, 10, 0, 58)
+list.Size = UDim2.new(1, -20, 1, -68)
+list.CanvasSize = UDim2.new()
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.ScrollBarThickness = 4
+list.ScrollBarImageColor3 = CONFIG.GREEN
+list.Parent = panel
+do
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+end
+
+local emptyLabel = Instance.new("TextLabel")
+emptyLabel.BackgroundTransparency = 1
+emptyLabel.Position = UDim2.new(0, 10, 0, 90)
+emptyLabel.Size = UDim2.new(1, -20, 0, 40)
+emptyLabel.Font = Enum.Font.Gotham
+emptyLabel.Text = "No other players in the server"
+emptyLabel.TextSize = 13
+emptyLabel.TextColor3 = Color3.fromRGB(130, 190, 150)
+emptyLabel.Visible = false
+emptyLabel.Parent = panel
+
+local panelOpen = false
+local setPanel -- forward declaration
+
+local thumbCache = {}
+
+local function makeEntry(plr, order)
+	local entry = Instance.new("TextButton")
+	entry.Name = plr.Name
+	entry.LayoutOrder = order
+	entry.Size = UDim2.new(1, -6, 0, 44)
+	entry.BackgroundColor3 = Color3.fromRGB(22, 52, 32)
+	entry.AutoButtonColor = false
+	entry.Text = ""
+	entry.Parent = list
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = entry
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = CONFIG.GREEN
+	stroke.Transparency = 0.7
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = entry
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.BackgroundColor3 = Color3.fromRGB(10, 30, 18)
+	avatar.Position = UDim2.fromOffset(8, 6)
+	avatar.Size = UDim2.fromOffset(32, 32)
+	avatar.Parent = entry
+	do
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(1, 0)
+		c.Parent = avatar
+	end
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Position = UDim2.fromOffset(48, 5)
+	nameLabel.Size = UDim2.new(1, -56, 0, 18)
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.Text = plr.DisplayName
+	nameLabel.TextSize = 14
+	nameLabel.TextColor3 = Color3.new(1, 1, 1)
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLabel.Parent = entry
+
+	local subLabel = Instance.new("TextLabel")
+	subLabel.BackgroundTransparency = 1
+	subLabel.Position = UDim2.fromOffset(48, 23)
+	subLabel.Size = UDim2.new(1, -56, 0, 14)
+	subLabel.Font = Enum.Font.Gotham
+	subLabel.Text = "@" .. plr.Name
+	subLabel.TextSize = 11
+	subLabel.TextColor3 = Color3.fromRGB(130, 190, 150)
+	subLabel.TextXAlignment = Enum.TextXAlignment.Left
+	subLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	subLabel.Parent = entry
+
+	task.spawn(function()
+		local content = thumbCache[plr.UserId]
+		if not content then
+			local ok, result = pcall(function()
+				return Players:GetUserThumbnailAsync(plr.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+			end)
+			if ok then
+				content = result
+				thumbCache[plr.UserId] = result
+			end
+		end
+		if content and avatar.Parent then
+			avatar.Image = content
+		end
+	end)
+
+	entry.MouseEnter:Connect(function()
+		TweenService:Create(entry, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(34, 86, 50) }):Play()
+		TweenService:Create(stroke, TweenInfo.new(0.15), { Transparency = 0.15 }):Play()
+	end)
+	entry.MouseLeave:Connect(function()
+		TweenService:Create(entry, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(22, 52, 32) }):Play()
+		TweenService:Create(stroke, TweenInfo.new(0.15), { Transparency = 0.7 }):Play()
+	end)
+	entry.Activated:Connect(function()
+		setPanel(false)
+		shootPortal(plr)
+	end)
+end
+
+local function refreshList(exclude)
+	for _, child in ipairs(list:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+	local others = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player and plr ~= exclude then
+			table.insert(others, plr)
+		end
+	end
+	table.sort(others, function(a, b)
+		return a.DisplayName:lower() < b.DisplayName:lower()
+	end)
+	for i, plr in ipairs(others) do
+		makeEntry(plr, i)
+	end
+	emptyLabel.Visible = (#others == 0)
+end
+
+local redBtn, redStroke -- assigned below
+
+setPanel = function(open)
+	if open == panelOpen then return end
+	panelOpen = open
+	if redStroke then
+		redStroke.Thickness = open and 3 or 1.5
+		redStroke.Transparency = open and 0 or 0.55
+	end
+	if open then
+		refreshList()
+		panel.Visible = true
+		TweenService:Create(panel, TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+			GroupTransparency = 0,
+		}):Play()
+		TweenService:Create(panelScale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+			Scale = 1,
+		}):Play()
+	else
+		TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			GroupTransparency = 1,
+		}):Play()
+		TweenService:Create(panelScale, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			Scale = 0.85,
+		}):Play()
+		task.delay(0.22, function()
+			if not panelOpen then
+				panel.Visible = false
+			end
+		end)
+	end
+end
+
+Players.PlayerAdded:Connect(function()
+	if panelOpen then refreshList() end
+end)
+Players.PlayerRemoving:Connect(function(plr)
+	if panelOpen then refreshList(plr) end
+end)
+
+------------------------------------------------------------------------
+-- CREATE THE THREE BUTTONS
+------------------------------------------------------------------------
+makeButton("TP", "TP", Color3.fromRGB(40, 140, 255), 1, "Teleport to nearest player", instantTeleport)
+makeButton("SafeTP", "SAFE", Color3.fromRGB(40, 200, 90), 2, "Safe teleport (90 studs left)", safeTeleport)
+redBtn, redStroke = makeButton("PortalMode", "PORT", Color3.fromRGB(235, 60, 60), 3, "Portal mode", function()
+	setPanel(not panelOpen)
+end)
